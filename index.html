@@ -127,9 +127,11 @@
         <div class="upload-inner">
           <label class="upload-label" for="workbookInput"><span>⇧</span>Selecionar planilha .xlsx</label>
           <input class="file-field" id="workbookInput" type="file" accept=".xlsx,.xls" />
+          <button class="btn firebase-btn" id="loadFirebaseBtn" type="button">☁ Carregar do painel</button>
           <div class="file-status" id="workbookStatus">
             Envie um único arquivo contendo as abas:
             <strong>PREVISTO DIA PESO e REAL DIA PESO</strong>
+            <span id="firebaseStatus" class="firebase-status">Realtime Database: conectando…</span>
           </div>
         </div>
       </article>
@@ -158,7 +160,7 @@
 
     <div class="footer">
       <span>Unidades mantidas separadas: t, m, pç e PD.</span>
-      <span class="tag">Importação via arquivo único</span>
+      <span class="tag">Dados sincronizados via Realtime Database</span>
     </div>
   
 </div>
@@ -206,6 +208,49 @@
 </section>
 </main>
 </div>
+
+
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-app.js";
+  import { getDatabase, ref, set, get, onValue } from "https://www.gstatic.com/firebasejs/12.15.0/firebase-database.js";
+
+  const firebaseConfig = {
+    apiKey: "AIzaSyBN_iUb34zIsUpXqsAuaonkt_EY0RAPInc",
+    authDomain: "quantitativos-programacao.firebaseapp.com",
+    databaseURL: "https://quantitativos-programacao-default-rtdb.firebaseio.com",
+    projectId: "quantitativos-programacao",
+    storageBucket: "quantitativos-programacao.firebasestorage.app",
+    messagingSenderId: "510042229762",
+    appId: "1:510042229762:web:961a1a9508fa006fdc2b1b",
+    measurementId: "G-Z9FMYRB23F"
+  };
+
+  try {
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+    const dataRef = ref(db, "quantitativos_programacao/arquivo_atual");
+
+    window.firebaseQuantitativos = {
+      ready: true,
+      async save(payload) {
+        await set(dataRef, payload);
+        return payload.meta;
+      },
+      async load() {
+        const snapshot = await get(dataRef);
+        return snapshot.exists() ? snapshot.val() : null;
+      },
+      listen(callback) {
+        return onValue(dataRef, snapshot => callback(snapshot.exists() ? snapshot.val() : null));
+      }
+    };
+    window.dispatchEvent(new Event("firebaseQuantitativosReady"));
+  } catch (error) {
+    console.error("Firebase Realtime Database não foi inicializado:", error);
+    window.firebaseQuantitativos = { ready: false, error };
+    window.dispatchEvent(new Event("firebaseQuantitativosReady"));
+  }
+</script>
 
 <script>
   const state = {
@@ -302,6 +347,45 @@
     return { name:actual, rows:parsed, dates:dateCols.map(x=>x.date) };
   }
 
+  function hydrateDataset(data){
+    const normalizeDates = list => (list || []).map(v => new Date(v + "T00:00:00"));
+    const normalizeRows = rows => (rows || []).map(r => ({
+      group: r.group || "",
+      discipline: r.discipline || "",
+      service: r.service || "",
+      unit: r.unit || "",
+      project: Number(r.project || 0),
+      values: r.values || {}
+    }));
+    state.prev = { rows: normalizeRows(data.prev?.rows), dates: normalizeDates(data.prev?.dates) };
+    state.real = { rows: normalizeRows(data.real?.rows), dates: normalizeDates(data.real?.dates) };
+  }
+
+  function serializeDataset(fileName){
+    const serializePart = part => ({
+      dates: (part.dates || []).map(dateKey),
+      rows: (part.rows || []).map(r => ({
+        group: r.group,
+        discipline: r.discipline,
+        service: r.service,
+        unit: r.unit,
+        project: Number(r.project || 0),
+        values: r.values || {}
+      }))
+    });
+
+    return {
+      meta: {
+        fileName,
+        updatedAt: new Date().toISOString(),
+        app: "Painel de Quantitativos",
+        version: 1
+      },
+      prev: serializePart(state.prev),
+      real: serializePart(state.real)
+    };
+  }
+
   async function readWorkbook(file){
     if(!file) return;
     if(!window.XLSX){
@@ -309,6 +393,7 @@
       return;
     }
 
+    document.getElementById("workbookStatus").innerHTML = `Lendo arquivo:<strong>${file.name}</strong>`;
     const buf = await file.arrayBuffer();
     const wb = XLSX.read(buf,{type:"array",cellDates:true});
 
@@ -325,18 +410,84 @@
 
     state.prev = prev;
     state.real = real;
-
     document.getElementById("workbookStatus").innerHTML =
       `Arquivo carregado:<strong>${file.name}</strong>` +
       `<span style="display:block;color:#65738e;margin-top:2px">Abas identificadas: ${prev.name} e ${real.name}</span>`;
 
     buildControls();
     render();
+
+    const fb = window.firebaseQuantitativos;
+    const status = document.getElementById("firebaseStatus");
+    if(fb?.ready){
+      status.textContent = "Realtime Database: salvando dados do painel…";
+      try{
+        const saved = await fb.save(serializeDataset(file.name));
+        status.textContent = `Realtime Database: dados salvos · ${new Date(saved.updatedAt).toLocaleString("pt-BR")}`;
+      }catch(error){
+        console.error(error);
+        status.textContent = "Realtime Database: não foi possível salvar. Verifique as regras.";
+      }
+    }
+  }
+
+  async function loadFromFirebase(showMessage=true){
+    const fb = window.firebaseQuantitativos;
+    if(!fb?.ready){
+      if(showMessage) alert("Realtime Database ainda não está pronto. Aguarde alguns segundos e tente novamente.");
+      return;
+    }
+    const button = document.getElementById("loadFirebaseBtn");
+    const status = document.getElementById("firebaseStatus");
+    button.disabled = true;
+    button.textContent = "☁ Carregando…";
+    status.textContent = "Realtime Database: carregando dados salvos…";
+    try{
+      const data = await fb.load();
+      if(!data) throw new Error("Nenhuma planilha foi salva ainda.");
+      hydrateDataset(data);
+      document.getElementById("workbookStatus").innerHTML =
+        `Dados carregados do painel:<strong>${data.meta?.fileName || "arquivo_atual.xlsx"}</strong>` +
+        `<span style="display:block;color:#65738e;margin-top:2px">Abas: PREVISTO DIA PESO e REAL DIA PESO</span>`;
+      buildControls();
+      render();
+      status.textContent = `Realtime Database: dados atualizados · ${new Date(data.meta?.updatedAt || Date.now()).toLocaleString("pt-BR")}`;
+    }catch(error){
+      console.error(error);
+      status.textContent = "Realtime Database: sem dados salvos ou acesso bloqueado.";
+      if(showMessage) alert(error.message || "Não foi possível carregar os dados do painel.");
+    }finally{
+      button.disabled = false;
+      button.textContent = "☁ Carregar do painel";
+    }
   }
 
   document.getElementById("workbookInput").addEventListener("change",e=>
     readWorkbook(e.target.files[0]).catch(err=>alert(err.message))
   );
+  document.getElementById("loadFirebaseBtn").addEventListener("click",()=>loadFromFirebase(true));
+
+  window.addEventListener("firebaseQuantitativosReady",()=>{
+    const fb = window.firebaseQuantitativos;
+    const status = document.getElementById("firebaseStatus");
+    if(fb?.ready){
+      status.textContent = "Realtime Database: conectado.";
+      loadFromFirebase(false);
+      // Atualiza automaticamente se outro usuário subir uma nova planilha.
+      fb.listen(data => {
+        if(!data || !data.prev || !data.real) return;
+        const currentName = document.querySelector("#workbookStatus strong")?.textContent || "";
+        if(data.meta?.fileName && currentName !== data.meta.fileName){
+          hydrateDataset(data);
+          buildControls();
+          render();
+          status.textContent = `Realtime Database: atualização recebida · ${new Date(data.meta?.updatedAt || Date.now()).toLocaleString("pt-BR")}`;
+        }
+      });
+    } else {
+      status.textContent = "Realtime Database: conexão indisponível.";
+    }
+  });
   document.getElementById("weekSelect").addEventListener("change",e=>{ state.weekStart = new Date(e.target.value+"T00:00:00"); render(); });
   ["groupSelect","disciplineSelect","searchInput"].forEach(id=>document.getElementById(id).addEventListener("input",render));
   document.getElementById("reloadBtn").addEventListener("click",()=>{ buildControls(); render(); });
